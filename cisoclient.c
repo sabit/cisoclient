@@ -24,7 +24,10 @@
 #include <dl_output.h>
 #include "ini.h"
 
-int pack(DL_UINT8 *packBuf)
+#define ISOHEADER 4
+#define ISOHEADERSTR "%04d"
+
+int pack(char *packBuf)
 {
     DL_ISO8583_HANDLER isoHandler;
     DL_ISO8583_MSG     isoMsg;
@@ -41,7 +44,7 @@ int pack(DL_UINT8 *packBuf)
     DL_ISO8583_MSG_Init(NULL,0,&isoMsg);
 
     /* set ISO message fields */
-    (void)DL_ISO8583_MSG_SetField_Str(0,"0800",&isoMsg);
+    (void)DL_ISO8583_MSG_SetField_Str(0,"1800",&isoMsg);
     (void)DL_ISO8583_MSG_SetField_Str(2,"1234567890123456",&isoMsg);
     (void)DL_ISO8583_MSG_SetField_Str(125,"BLAH BLAH",&isoMsg);
 
@@ -57,6 +60,26 @@ int pack(DL_UINT8 *packBuf)
     /* output packed message (in hex) */
     return packedSize;
 
+}
+
+int unpack(char *packBuf, unsigned short pack_len)
+{
+    DL_ISO8583_HANDLER isoHandler;
+    DL_ISO8583_MSG     isoMsg;
+    /* get ISO-8583 1993 handler */
+    DL_ISO8583_DEFS_1993_GetHandler(&isoHandler);
+ /* initialise ISO message */
+    DL_ISO8583_MSG_Init(NULL,0,&isoMsg);
+
+    /* unpack ISO message */
+    (void)DL_ISO8583_MSG_Unpack(&isoHandler,packBuf,pack_len,&isoMsg);
+
+    /* output ISO message content */
+    DL_ISO8583_MSG_Dump(stdout,NULL,&isoHandler,&isoMsg);
+
+    /* free ISO message */
+    DL_ISO8583_MSG_Free(&isoMsg);
+    return 0;
 }
 
 typedef struct
@@ -92,9 +115,12 @@ int main(int argc, char *argv[])
     char *hostbuf, *host, *uri, *pbuf;
     int port;
     cp_string *buf;
-    DL_UINT8 isoBuf[10000];
-    DL_UINT16 iso_buf_size;
-    char iso_buf_size_ascii[5];
+    char iso_req_buf[10000];
+    char iso_resp_buf[10000];
+    unsigned short iso_req_size;
+    unsigned short iso_resp_size;
+    int raw_resp_size;
+    char iso_header[ISOHEADER+1];
 
     cp_log_init("test_client.log", LOG_LEVEL_DEBUG);
 
@@ -106,8 +132,12 @@ int main(int argc, char *argv[])
     host = strdup(config.host);
     port = config.port;
     cp_log("Host: %s Port: %d", host, port);
-
+    cp_client_init();
     client = cp_client_create(host, port);
+    cp_client_set_timeout(client, 1, 1);
+    cp_client_set_retry(client, 1);
+    cp_log("Connecting\n");
+
     if (client == NULL)
     {
         printf("can\'t create client\n");
@@ -120,23 +150,31 @@ int main(int argc, char *argv[])
         exit(3);
     }
 
-    //sprintf(request, request_fmt, uri, host);
-    iso_buf_size = pack(isoBuf+4);
-    DL_OUTPUT_Hex(stdout,NULL,isoBuf,iso_buf_size+4);
-    sprintf(iso_buf_size_ascii, "%04d", iso_buf_size);
-    strncpy(isoBuf, iso_buf_size_ascii, 4);
-    DL_OUTPUT_Hex(stdout,NULL,isoBuf,iso_buf_size+4);
+    //Pack ISO msg
+    iso_req_size = pack(iso_req_buf+ISOHEADER);
+    sprintf(iso_header, ISOHEADERSTR, iso_req_size);
+    strncpy(iso_req_buf, iso_header, ISOHEADER);
 
-    if (write(client->fd, isoBuf, iso_buf_size+4) == -1)
+    //Send ISO Request
+    if (write(client->fd, iso_req_buf, iso_req_size+ISOHEADER) == -1)
         perror("write");
 
-    buf = cp_string_read(client->fd, 4);
-    iso_buf_size=atoi(cp_string_data((buf)));
-    cp_log("ISO Resp Size: %d\n", iso_buf_size );
-    buf = cp_string_read(client->fd, iso_buf_size);
-    cp_ndump(LOG_LEVEL_INFO, buf, iso_buf_size);
-    cp_string_destroy(buf);
+    //response processing
+    if(cp_client_read(client, iso_resp_buf, ISOHEADER)!=ISOHEADER)
+    {
+        cp_warn("No response from server");
+        return 1;
+    }
+    iso_resp_buf[ISOHEADER] = '\0';
+    iso_resp_size=atoi(iso_resp_buf);
+    if(cp_client_read(client, iso_resp_buf+ISOHEADER, iso_resp_size) != iso_resp_size)
+    {
+        cp_warn("ISO msg + header != packet length");
+        return 1;
+    }
 
+    DL_OUTPUT_Hex(stdout,NULL,iso_resp_buf,iso_resp_size+ISOHEADER);
+    unpack(iso_resp_buf+ISOHEADER, iso_resp_size);
     cp_client_close(client);
     cp_client_destroy(client);
 
